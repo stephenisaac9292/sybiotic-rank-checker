@@ -9,18 +9,22 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers, // Added this just in case, good for member caching
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
 // ============ CONFIGURATION ============
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const GUILD_ID = process.env.GUILD_ID;
+
+// [UPDATED] SEPARATE IDs: One for MEE6 data, one for your bot's home
+const MEE6_SERVER_ID = process.env.MEE6_SERVER_ID || '1308889840808366110'; // Symbiotic
+const MY_SERVER_ID = process.env.MY_SERVER_ID; // Your personal server
+
 const ALLOWED_CHANNEL_ID = process.env.ALLOWED_CHANNEL_ID;
-const INITIAL_SYNC_INTERVAL = parseInt(process.env.INITIAL_SYNC_INTERVAL) || 60; // minutes - full sync
-const NEW_USER_SCAN_INTERVAL = parseInt(process.env.NEW_USER_SCAN_INTERVAL) || 5; // minutes - check for new users
+const INITIAL_SYNC_INTERVAL = parseInt(process.env.INITIAL_SYNC_INTERVAL) || 60; // minutes
+const NEW_USER_SCAN_INTERVAL = parseInt(process.env.NEW_USER_SCAN_INTERVAL) || 5; // minutes
 const DB_PATH = process.env.DB_PATH || './mee6_ranks.db';
-const MEE6_TOKEN = process.env.MEE6_TOKEN; // <--- [IMPLEMENTED]
+const MEE6_TOKEN = process.env.MEE6_TOKEN;
 
 let db;
 let lastFullSync = null;
@@ -52,11 +56,7 @@ async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_xp ON leaderboard(xp DESC);
     CREATE INDEX IF NOT EXISTS idx_level ON leaderboard(level DESC);
     CREATE INDEX IF NOT EXISTS idx_updated ON leaderboard(last_updated DESC);
-  `);
 
-  console.log('✅ Database initialized');
-  
-  await db.exec(`
     CREATE TABLE IF NOT EXISTS sync_metadata (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       last_full_sync INTEGER,
@@ -71,21 +71,20 @@ async function initDatabase() {
     INSERT OR IGNORE INTO sync_metadata (id, last_full_sync, last_new_user_scan, total_users, sync_duration, status)
     VALUES (1, 0, 0, 0, 0, 'pending')
   `);
+
+  console.log('✅ Database initialized');
 }
 
-// ============ LIVE XP FETCH (Real-time from MEE6 API) ============
-async function fetchLiveUserData(guildId, userId) {
+// ============ LIVE XP FETCH (FROM SYMBIOTIC) ============
+async function fetchLiveUserData(userId) {
   try {
     console.log(`[LIVE] Fetching real-time data for user ${userId}`);
-    
-    // Try direct user lookup endpoint
+    // [UPDATED] Uses MEE6_SERVER_ID to get correct data
     const response = await axios.get(
-      `https://mee6.xyz/api/plugins/levels/leaderboard/${guildId}?limit=1&user_id=${userId}`,
+      `https://mee6.xyz/api/plugins/levels/leaderboard/${MEE6_SERVER_ID}?limit=1&user_id=${userId}`,
       {
         timeout: 8000,
-        headers: {
-          'Authorization': MEE6_TOKEN, // <--- [IMPLEMENTED]
-        },
+        headers: { 'Authorization': MEE6_TOKEN },
       }
     );
 
@@ -101,111 +100,85 @@ async function fetchLiveUserData(guildId, userId) {
         messageCount: player.message_count || 0,
       };
     }
-
     return null;
   } catch (error) {
     console.error('[LIVE] Error fetching live data:', error.message);
     if (error.response && error.response.status === 401) {
-        console.error('🚨 MEE6 TOKEN INVALID OR EXPIRED! Check your .env file.');
+        console.error('🚨 LIVE FETCH FAILED: MEE6 TOKEN EXPIRED! Update .env file.');
     }
     return null;
   }
 }
 
-// ============ HYBRID LOOKUP: Database Rank + Live XP ============
+// ============ HYBRID LOOKUP ============
 async function hybridUserLookup(userId) {
   try {
-    // Step 1: Get user's rank from database (instant)
-    let dbUser = await db.get(
-      'SELECT * FROM leaderboard WHERE user_id = ?',
-      userId
-    );
+    // 1. Instant DB check
+    let dbUser = await db.get('SELECT * FROM leaderboard WHERE user_id = ?', userId);
 
-    // Step 2: Fetch live XP data from MEE6 API
-    const liveData = await fetchLiveUserData(GUILD_ID, userId);
+    // 2. Live API check (on Symbiotic server)
+    const liveData = await fetchLiveUserData(userId);
 
     if (!liveData) {
-      // If live fetch fails, return database data (if exists)
+      // If API fails but we have old data, show it as cached
       if (dbUser) {
-        const dataAge = Math.floor((Date.now() - dbUser.last_updated) / 1000 / 60);
-        return {
-          rank: dbUser.rank,
-          level: dbUser.level,
-          xp: dbUser.xp,
-          username: dbUser.username,
-          avatar: dbUser.avatar,
-          messageCount: dbUser.message_count,
-          dataAge: dataAge,
-          isLive: false,
-        };
+         const dataAge = Math.floor((Date.now() - dbUser.last_updated) / 1000 / 60);
+         return { 
+             rank: dbUser.rank,
+             level: dbUser.level,
+             xp: dbUser.xp,
+             username: dbUser.username,
+             avatar: dbUser.avatar,
+             messageCount: dbUser.message_count,
+             dataAge: dataAge,
+             isLive: false 
+         };
       }
       return null;
     }
 
-    // Step 3: Update database with fresh data
-    if (!dbUser) {
-      // New user - add to database and trigger rank calculation
-      console.log(`[NEW USER] Adding ${userId} to database`);
-      
-      await db.run(`
-        INSERT INTO leaderboard 
-        (user_id, username, discriminator, avatar, rank, level, xp, message_count, last_updated, is_live)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `, [
-        liveData.userId,
-        liveData.username,
-        liveData.discriminator,
-        liveData.avatar,
-        999999, // Temporary rank, will be calculated
-        liveData.level,
-        liveData.xp,
-        liveData.messageCount,
-        Date.now(),
-        1
-      ]);
-
-      // Calculate actual rank based on XP
-      const rank = await calculateUserRank(liveData.xp);
-      
-      await db.run(
-        'UPDATE leaderboard SET rank = ? WHERE user_id = ?',
-        [rank, userId]
-      );
-
-      dbUser = await db.get('SELECT * FROM leaderboard WHERE user_id = ?', userId);
-    } else {
-      // Existing user - update with live data
-      await db.run(`
-        UPDATE leaderboard 
-        SET username = ?, avatar = ?, level = ?, xp = ?, message_count = ?, last_updated = ?, is_live = 1
-        WHERE user_id = ?
-      `, [
-        liveData.username,
-        liveData.avatar,
-        liveData.level,
-        liveData.xp,
-        liveData.messageCount,
-        Date.now(),
-        userId
-      ]);
-
-      // Recalculate rank if XP changed significantly
-      if (Math.abs(dbUser.xp - liveData.xp) > 100) {
-        const newRank = await calculateUserRank(liveData.xp);
-        await db.run('UPDATE leaderboard SET rank = ? WHERE user_id = ?', [newRank, userId]);
-        dbUser.rank = newRank;
-      }
+    // 3. Update DB with fresh data
+    // Calculate rank if new user, otherwise use existing (will be corrected by next full sync if wrong)
+    let currentRank = 999999;
+    if (dbUser) {
+        currentRank = dbUser.rank;
     }
 
+    if (!dbUser) {
+         console.log(`[NEW USER] Adding ${userId} to database`);
+         // Calculate actual rank based on XP for new user
+         currentRank = await calculateUserRank(liveData.xp);
+    } else if (Math.abs(dbUser.xp - liveData.xp) > 10) {
+         // Recalculate rank if XP changed significantly
+         currentRank = await calculateUserRank(liveData.xp);
+    }
+
+    await db.run(`
+      INSERT OR REPLACE INTO leaderboard 
+      (user_id, username, discriminator, avatar, rank, level, xp, message_count, last_updated, is_live)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      liveData.userId, 
+      liveData.username, 
+      liveData.discriminator,
+      liveData.avatar, 
+      currentRank, 
+      liveData.level, 
+      liveData.xp, 
+      liveData.messageCount, 
+      Date.now(), 
+      1
+    ]);
+
     return {
-      rank: dbUser.rank,
-      level: liveData.level,
-      xp: liveData.xp,
-      username: liveData.username,
-      avatar: liveData.avatar,
-      messageCount: liveData.messageCount,
-      dataAge: 0, // Real-time data
-      isLive: true,
+        rank: currentRank,
+        level: liveData.level,
+        xp: liveData.xp,
+        username: liveData.username,
+        avatar: liveData.avatar,
+        messageCount: liveData.messageCount,
+        dataAge: 0,
+        isLive: true,
     };
 
   } catch (error) {
@@ -228,20 +201,18 @@ async function calculateUserRank(userXp) {
   }
 }
 
-// ============ INITIAL FULL SYNC (One-time or periodic) ============
+// ============ FULL LEADERBOARD SYNC ============
 async function fullLeaderboardSync() {
   if (isSyncing) {
-    console.log('⏭️ Sync already in progress, skipping...');
-    return;
+      console.log('⏭️ Sync already in progress, skipping...');
+      return;
   }
-
   isSyncing = true;
   const startTime = Date.now();
-  console.log('\n🔄 Starting full leaderboard sync...');
+  console.log(`\n🔄 Starting full sync from Symbiotic (${MEE6_SERVER_ID})...`);
 
   try {
     await db.run('UPDATE sync_metadata SET status = ? WHERE id = 1', 'syncing');
-
     let page = 0;
     let totalUsers = 0;
     let hasMore = true;
@@ -251,13 +222,12 @@ async function fullLeaderboardSync() {
 
     while (hasMore && page < 2500) {
       try {
+        // [UPDATED] Uses MEE6_SERVER_ID
         const response = await axios.get(
-          `https://mee6.xyz/api/plugins/levels/leaderboard/${GUILD_ID}?page=${page}&limit=1000`,
+          `https://mee6.xyz/api/plugins/levels/leaderboard/${MEE6_SERVER_ID}?page=${page}&limit=1000`,
           {
             timeout: 15000,
-            headers: {
-              'Authorization': MEE6_TOKEN, // <--- [IMPLEMENTED]
-            },
+            headers: { 'Authorization': MEE6_TOKEN },
           }
         );
 
@@ -267,7 +237,7 @@ async function fullLeaderboardSync() {
         }
 
         const players = response.data.players;
-        
+
         for (const player of players) {
           currentRank++;
           await db.run(`
@@ -291,33 +261,26 @@ async function fullLeaderboardSync() {
         totalUsers += players.length;
         console.log(`📥 Synced page ${page + 1} | Total users: ${totalUsers} | Rank: #${currentRank}`);
 
-        if (players.length < 1000) {
-          hasMore = false;
-        }
-
+        if (players.length < 1000) hasMore = false;
         page++;
-        await new Promise(resolve => setTimeout(resolve, 200));
+        await new Promise(resolve => setTimeout(resolve, 200)); // Rate limit protection
 
       } catch (error) {
         console.error(`❌ Error syncing page ${page}:`, error.message);
-        
-        if (error.response?.status === 429) {
-          console.log('⏸️ Rate limited, waiting 30 seconds...');
-          await new Promise(resolve => setTimeout(resolve, 30000));
-          continue;
-        }
-        if (error.response?.status === 401) {
+        if (error.response && error.response.status === 429) {
+            console.log('⏸️ Rate limited by MEE6, waiting 30s...');
+            await new Promise(resolve => setTimeout(resolve, 30000));
+        } else if (error.response && error.response.status === 401) {
              console.error('🚨 SYNC STOPPED: MEE6 TOKEN EXPIRED! Update your .env file.');
              hasMore = false;
              break;
+        } else {
+            page++;
         }
-        
-        page++;
       }
     }
 
     await db.run('COMMIT');
-
     const syncDuration = Math.floor((Date.now() - startTime) / 1000);
     lastFullSync = Date.now();
 
@@ -339,61 +302,39 @@ async function fullLeaderboardSync() {
   }
 }
 
-// ============ SCAN FOR NEW USERS (Top pages only) ============
+// ============ NEW USER SCANNER ============
 async function scanForNewUsers() {
   console.log('\n🔍 Scanning for new users (top 5000)...');
-  
   try {
-    let newUsersFound = 0;
-    const pagesToScan = 5; // Check top 5000 users (5 pages × 1000)
-
-    for (let page = 0; page < pagesToScan; page++) {
-      const response = await axios.get(
-        `https://mee6.xyz/api/plugins/levels/leaderboard/${GUILD_ID}?page=${page}&limit=1000`,
-        {
-          timeout: 10000,
-          headers: {
-            'Authorization': MEE6_TOKEN, // <--- [IMPLEMENTED]
-          },
-        }
-      );
-
-      if (!response.data || !response.data.players) break;
-
-      for (const player of response.data.players) {
-        const exists = await db.get('SELECT user_id FROM leaderboard WHERE user_id = ?', player.id);
+      let newUsersFound = 0;
+      const pagesToScan = 5; // Check top 5000 users
+      for (let page = 0; page < pagesToScan; page++) {
+        const response = await axios.get(
+            `https://mee6.xyz/api/plugins/levels/leaderboard/${MEE6_SERVER_ID}?page=${page}&limit=1000`,
+            { timeout: 10000, headers: { 'Authorization': MEE6_TOKEN } }
+        );
+        if (!response.data || !response.data.players) break;
         
-        if (!exists) {
-          const rank = await calculateUserRank(player.xp || 0);
-          
-          await db.run(`
-            INSERT INTO leaderboard 
-            (user_id, username, discriminator, avatar, rank, level, xp, message_count, last_updated, is_live)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `, [
-            player.id,
-            player.username || 'Unknown',
-            player.discriminator || '0',
-            player.avatar || null,
-            rank,
-            player.level || 0,
-            player.xp || 0,
-            player.message_count || 0,
-            Date.now(),
-            0
-          ]);
-
-          newUsersFound++;
+        for (const player of response.data.players) {
+            const exists = await db.get('SELECT user_id FROM leaderboard WHERE user_id = ?', player.id);
+            if (!exists) {
+                 const rank = await calculateUserRank(player.xp || 0);
+                 await db.run(`
+                    INSERT INTO leaderboard 
+                    (user_id, username, discriminator, avatar, rank, level, xp, message_count, last_updated, is_live)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 `, [
+                    player.id, player.username || 'Unknown', player.discriminator || '0', player.avatar || null,
+                    rank, player.level || 0, player.xp || 0, player.message_count || 0, Date.now(), 0
+                 ]);
+                 newUsersFound++;
+            }
         }
+        await new Promise(r => setTimeout(r, 200));
       }
-
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-
-    lastNewUserScan = Date.now();
-    await db.run('UPDATE sync_metadata SET last_new_user_scan = ? WHERE id = 1', lastNewUserScan);
-
-    console.log(`✅ New user scan complete. Found ${newUsersFound} new users\n`);
+      lastNewUserScan = Date.now();
+      await db.run('UPDATE sync_metadata SET last_new_user_scan = ? WHERE id = 1', lastNewUserScan);
+      console.log(`✅ New user scan complete. Found ${newUsersFound} new users\n`);
 
   } catch (error) {
     console.error('❌ New user scan failed:', error.message);
@@ -410,7 +351,7 @@ function createRankEmbed(userData) {
 
   const embed = new EmbedBuilder()
     .setColor(userData.isLive ? '#57F287' : '#5865F2')
-    .setTitle('📊 MEE6 Rank Lookup')
+    .setTitle('📊 Symbiotic Rank Lookup')
     .setDescription(`**${userData.username}**`)
     .addFields(
       { name: '🏆 Rank', value: `#${userData.rank.toLocaleString()}`, inline: true },
@@ -432,7 +373,7 @@ function createRankEmbed(userData) {
   embed.setTimestamp();
 
   if (userData.avatar) {
-    embed.setThumbnail(`https://cdn.discordapp.com/avatars/${userData.userId || 'default'}/${userData.avatar}.png`);
+    embed.setThumbnail(`https://cdn.discordapp.com/avatars/${userData.userId}/${userData.avatar}.png`);
   }
 
   return embed;
@@ -445,7 +386,7 @@ function createErrorEmbed(errorType, extraInfo = '') {
 
   switch (errorType) {
     case 'USER_NOT_FOUND':
-      embed.setDescription('You are not ranked on the MEE6 leaderboard yet. Send some messages to gain XP!');
+      embed.setDescription('You are not ranked on the Symbiotic leaderboard yet.');
       break;
     case 'DB_NOT_READY':
       embed.setDescription(`Database is being set up. Please try again in a few minutes.\n\n${extraInfo}`);
@@ -460,169 +401,104 @@ function createErrorEmbed(errorType, extraInfo = '') {
   return embed;
 }
 
-// ============ COMMAND HANDLER ============
-async function handleRankCommand(interaction, userId) {
-  if (ALLOWED_CHANNEL_ID && interaction.channelId !== ALLOWED_CHANNEL_ID) {
-    return interaction.reply({
-      embeds: [createErrorEmbed('WRONG_CHANNEL')],
-      ephemeral: true,
-    });
-  }
-
-  await interaction.deferReply();
-
-  try {
-    // Check if initial sync is done
-    const metadata = await db.get('SELECT * FROM sync_metadata WHERE id = 1');
-    
-    if (!metadata || metadata.total_users === 0) {
-      return interaction.editReply({
-        embeds: [createErrorEmbed('DB_NOT_READY', 'Initial sync in progress. Check console for status.')],
-      });
-    }
-
-    // Hybrid lookup: DB rank + Live XP
-    const userData = await hybridUserLookup(userId);
-
-    if (!userData) {
-      return interaction.editReply({
-        embeds: [createErrorEmbed('USER_NOT_FOUND')],
-      });
-    }
-
-    const embed = createRankEmbed(userData);
-    await interaction.editReply({
-      embeds: [embed],
-    });
-
-  } catch (error) {
-    console.error('Command error:', error);
-    await interaction.editReply({
-      embeds: [createErrorEmbed('GENERIC')],
-    });
-  }
-}
-
 // ============ BOT EVENTS ============
 client.once('ready', async () => {
-  console.log(`✅ Bot logged in as ${client.user.tag}`);
-  console.log(`📊 Monitoring guild: ${GUILD_ID}`);
-  console.log(`📢 Allowed channel: ${ALLOWED_CHANNEL_ID || 'ALL'}`);
-  console.log(`🔄 Full sync interval: ${INITIAL_SYNC_INTERVAL} minutes`);
-  console.log(`🔍 New user scan interval: ${NEW_USER_SCAN_INTERVAL} minutes`);
-  console.log(`💾 Database: ${DB_PATH}`);
-  console.log(`⚡ Mode: HYBRID (DB rank + Live XP)\n`);
+  console.log(`\n✅ Logged in as: ${client.user.tag}`);
+  console.log(`📡 Fetching data from Symbiotic Server ID: ${MEE6_SERVER_ID}`);
+  console.log(`🏠 Operating in Your Personal Server ID: ${MY_SERVER_ID}`);
 
-  if (!MEE6_TOKEN) {
-      console.warn('⚠️ WARNING: MEE6_TOKEN is missing from .env! Sync will likely fail with 401 errors.\n');
+  if (!MEE6_TOKEN) console.warn('⚠️ WARNING: MEE6_TOKEN is missing! Sync will fail.');
+  if (!MY_SERVER_ID) {
+      console.error('❌ FATAL ERROR: MY_SERVER_ID is missing in .env! Cannot register commands.');
+      process.exit(1);
   }
 
   await initDatabase();
 
-  // Check if initial sync needed
-  const metadata = await db.get('SELECT * FROM sync_metadata WHERE id = 1');
-  
-  if (!metadata || metadata.total_users === 0) {
-    console.log('🚀 First run detected. Starting initial full sync...');
-    fullLeaderboardSync().catch(console.error);
+  // Start initial sync if DB is empty
+  const meta = await db.get('SELECT * FROM sync_metadata WHERE id = 1');
+  if (!meta || meta.total_users === 0) {
+      console.log('🚀 First run detected. Starting initial full sync...');
+      fullLeaderboardSync().catch(console.error);
   } else {
-    console.log(`📊 Database loaded: ${metadata.total_users} users`);
-    console.log('✅ Bot ready for commands!\n');
+      console.log(`📊 Database loaded: ${meta.total_users} users`);
+      console.log('✅ Bot ready for commands!\n');
   }
 
-  // Schedule periodic full sync
+  // Schedule background tasks
   setInterval(() => {
-    console.log(`⏰ Scheduled full sync starting...`);
-    fullLeaderboardSync().catch(console.error);
+      console.log(`⏰ Scheduled full sync starting...`);
+      fullLeaderboardSync().catch(console.error);
   }, INITIAL_SYNC_INTERVAL * 60 * 1000);
 
-  // Schedule new user scanning (more frequent)
   setInterval(() => {
-    console.log(`⏰ Scanning for new users...`);
-    scanForNewUsers().catch(console.error);
+      console.log(`⏰ Scanning for new users...`);
+      scanForNewUsers().catch(console.error);
   }, NEW_USER_SCAN_INTERVAL * 60 * 1000);
 
-  // Register slash commands
-  const commands = [
-    new SlashCommandBuilder()
-      .setName('irank')
-      .setDescription('Check your MEE6 rank (instant!) and level (live!)'),
-  ];
-
+  // [UPDATED] Register commands to YOUR personal server
   const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-
   try {
-    console.log('🔄 Registering slash commands...');
-    await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), {
-      body: commands,
-    });
-    console.log('✅ Slash commands registered!\n');
+    console.log(`🔄 Registering slash commands to YOUR server (${MY_SERVER_ID})...`);
+    await rest.put(
+      Routes.applicationGuildCommands(client.user.id, MY_SERVER_ID),
+      { body: [new SlashCommandBuilder().setName('irank').setDescription('Check Symbiotic Rank')] }
+    );
+    console.log('✅ Slash commands registered successfully!\n');
   } catch (error) {
-    console.error('❌ Failed to register slash commands:', error);
+    console.error('❌ Command registration failed:', error);
   }
 
   client.user.setActivity('irank! | /irank', { type: 'WATCHING' });
 });
 
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === 'irank') {
-    await handleRankCommand(interaction, interaction.user.id);
+// Unified Command Processor
+async function handleRankCommand(source, isMessage = false, userId) {
+  if (ALLOWED_CHANNEL_ID && source.channelId !== ALLOWED_CHANNEL_ID) {
+      const errEmbed = createErrorEmbed('WRONG_CHANNEL');
+      return isMessage ? source.reply({ embeds: [errEmbed] }) : source.reply({ embeds: [errEmbed], ephemeral: true });
   }
+
+  // Defer Reply
+  if (isMessage) {
+      var loadingMsg = await source.reply('⚡ Fetching rank...');
+  } else {
+      await source.deferReply();
+  }
+
+  // Helper to edit response
+  const sendResponse = async (payload) => {
+      if (isMessage && loadingMsg) return loadingMsg.edit(payload);
+      return isMessage ? source.channel.send(payload) : source.editReply(payload);
+  };
+
+  try {
+      const metadata = await db.get('SELECT * FROM sync_metadata WHERE id = 1');
+      if (!metadata || metadata.total_users === 0) {
+          return sendResponse({ embeds: [createErrorEmbed('DB_NOT_READY', 'Initial sync in progress.')] });
+      }
+
+      const userData = await hybridUserLookup(userId);
+      if (!userData) {
+          return sendResponse({ embeds: [createErrorEmbed('USER_NOT_FOUND')] });
+      }
+
+      await sendResponse({ content: '', embeds: [createRankEmbed(userData)] });
+
+  } catch (error) {
+      console.error('Command error:', error);
+      await sendResponse({ embeds: [createErrorEmbed('GENERIC')] });
+  }
+}
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'irank') return;
+  await handleRankCommand(interaction, false, interaction.user.id);
 });
 
 client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-  if (!message.content.toLowerCase().startsWith('irank!')) return;
-
-  if (ALLOWED_CHANNEL_ID && message.channelId !== ALLOWED_CHANNEL_ID) {
-    return message.reply({
-      embeds: [createErrorEmbed('WRONG_CHANNEL')],
-    });
-  }
-
-  const fakeInteraction = {
-    channelId: message.channelId,
-    deferReply: async () => {
-      fakeInteraction.loadingMessage = await message.reply('⚡ Fetching your rank...');
-    },
-    editReply: async (options) => {
-      if (fakeInteraction.loadingMessage) {
-        await fakeInteraction.loadingMessage.edit(options);
-      }
-    },
-  };
-
-  await fakeInteraction.deferReply();
-
-  try {
-    const metadata = await db.get('SELECT * FROM sync_metadata WHERE id = 1');
-    
-    if (!metadata || metadata.total_users === 0) {
-      return fakeInteraction.editReply({
-        embeds: [createErrorEmbed('DB_NOT_READY', 'Initial sync in progress.')],
-      });
-    }
-
-    const userData = await hybridUserLookup(message.author.id);
-
-    if (!userData) {
-      return fakeInteraction.editReply({
-        embeds: [createErrorEmbed('USER_NOT_FOUND')],
-      });
-    }
-
-    const embed = createRankEmbed(userData);
-    await fakeInteraction.editReply({
-      embeds: [embed],
-    });
-
-  } catch (error) {
-    console.error('Command error:', error);
-    await fakeInteraction.editReply({
-      embeds: [createErrorEmbed('GENERIC')],
-    });
+  if (!message.author.bot && message.content.toLowerCase().startsWith('irank!')) {
+     await handleRankCommand(message, true, message.author.id);
   }
 });
 
