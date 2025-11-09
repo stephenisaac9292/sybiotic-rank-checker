@@ -9,6 +9,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers, // Added this just in case, good for member caching
   ],
 });
 
@@ -19,6 +20,7 @@ const ALLOWED_CHANNEL_ID = process.env.ALLOWED_CHANNEL_ID;
 const INITIAL_SYNC_INTERVAL = parseInt(process.env.INITIAL_SYNC_INTERVAL) || 60; // minutes - full sync
 const NEW_USER_SCAN_INTERVAL = parseInt(process.env.NEW_USER_SCAN_INTERVAL) || 5; // minutes - check for new users
 const DB_PATH = process.env.DB_PATH || './mee6_ranks.db';
+const MEE6_TOKEN = process.env.MEE6_TOKEN; // <--- [IMPLEMENTED]
 
 let db;
 let lastFullSync = null;
@@ -82,7 +84,7 @@ async function fetchLiveUserData(guildId, userId) {
       {
         timeout: 8000,
         headers: {
-          'User-Agent': 'Discord Bot - Rank Lookup Service',
+          'Authorization': MEE6_TOKEN, // <--- [IMPLEMENTED]
         },
       }
     );
@@ -103,6 +105,9 @@ async function fetchLiveUserData(guildId, userId) {
     return null;
   } catch (error) {
     console.error('[LIVE] Error fetching live data:', error.message);
+    if (error.response && error.response.status === 401) {
+        console.error('🚨 MEE6 TOKEN INVALID OR EXPIRED! Check your .env file.');
+    }
     return null;
   }
 }
@@ -251,7 +256,7 @@ async function fullLeaderboardSync() {
           {
             timeout: 15000,
             headers: {
-              'User-Agent': 'Discord Bot - Rank Sync Service',
+              'Authorization': MEE6_TOKEN, // <--- [IMPLEMENTED]
             },
           }
         );
@@ -301,6 +306,11 @@ async function fullLeaderboardSync() {
           await new Promise(resolve => setTimeout(resolve, 30000));
           continue;
         }
+        if (error.response?.status === 401) {
+             console.error('🚨 SYNC STOPPED: MEE6 TOKEN EXPIRED! Update your .env file.');
+             hasMore = false;
+             break;
+        }
         
         page++;
       }
@@ -343,7 +353,7 @@ async function scanForNewUsers() {
         {
           timeout: 10000,
           headers: {
-            'User-Agent': 'Discord Bot - New User Scanner',
+            'Authorization': MEE6_TOKEN, // <--- [IMPLEMENTED]
           },
         }
       );
@@ -387,6 +397,9 @@ async function scanForNewUsers() {
 
   } catch (error) {
     console.error('❌ New user scan failed:', error.message);
+    if (error.response && error.response.status === 401) {
+        console.error('🚨 SCAN FAILED: MEE6 TOKEN EXPIRED! Update your .env file.');
+    }
   }
 }
 
@@ -499,6 +512,10 @@ client.once('ready', async () => {
   console.log(`🔍 New user scan interval: ${NEW_USER_SCAN_INTERVAL} minutes`);
   console.log(`💾 Database: ${DB_PATH}`);
   console.log(`⚡ Mode: HYBRID (DB rank + Live XP)\n`);
+
+  if (!MEE6_TOKEN) {
+      console.warn('⚠️ WARNING: MEE6_TOKEN is missing from .env! Sync will likely fail with 401 errors.\n');
+  }
 
   await initDatabase();
 
