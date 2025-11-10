@@ -47,16 +47,18 @@ async function initDatabase() {
   console.log('✅ Database initialized');
 }
 
-// ============ LIVE XP FETCH ============
+// ============ LIVE XP FETCH (BULLETPROOF) ============
 async function fetchLiveUserData(targetUserId) {
   try {
     const response = await axios.get(
       `https://mee6.xyz/api/plugins/levels/leaderboard/${MEE6_SERVER_ID}?limit=1&user_id=${targetUserId}&bust=${Date.now()}`,
       { timeout: 5000, headers: { 'Authorization': MEE6_TOKEN } }
     );
+
     let player = null;
     if (response.data?.players) player = response.data.players.find(p => p.id === targetUserId);
     if (!player && response.data?.player?.id === targetUserId) player = response.data.player;
+
     if (player) {
        return {
         userId: player.id, username: player.username, avatar: player.avatar,
@@ -72,17 +74,21 @@ async function hybridUserLookup(userId) {
   try {
     let dbUser = await db.get('SELECT * FROM leaderboard WHERE user_id = ?', userId);
     const liveData = await fetchLiveUserData(userId);
+
     if (!liveData) {
       if (dbUser) return { ...dbUser, dataAge: Math.floor((Date.now() - dbUser.last_updated)/60000), isLive: false };
       return null;
     }
+
     let rank = dbUser ? dbUser.rank : 999999;
     if (!dbUser || Math.abs(dbUser.xp - liveData.xp) > 50) {
        const res = await db.get('SELECT COUNT(*) as rank FROM leaderboard WHERE xp > ?', liveData.xp);
        rank = (res.rank || 0) + 1;
     }
+
     await db.run(`INSERT OR REPLACE INTO leaderboard (user_id, username, avatar, rank, level, xp, message_count, last_updated, is_live) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
       [liveData.userId, liveData.username, liveData.avatar, rank, liveData.level, liveData.xp, liveData.messageCount, Date.now()]);
+
     return { ...liveData, rank, isLive: true };
   } catch (e) { console.error(e); return null; }
 }
@@ -144,45 +150,54 @@ client.once('ready', async () => {
   } catch (e) { console.error('Command register failed:', e); }
 });
 
+// ============ UNIFIED COMMAND HANDLER ============
 async function handleRankCommand(source, isMessage = false, userId) {
-  // Channel check is now redundant for messages due to auto-delete, but good for slash interaction safety
+  // 1. CHANNEL CHECK & REDIRECT
   if (ALLOWED_CHANNEL_ID && source.channelId !== ALLOWED_CHANNEL_ID) {
-      const err = new EmbedBuilder().setColor('Red').setDescription(`Wrong channel. Use <#${ALLOWED_CHANNEL_ID}>`);
-      return isMessage ? null : source.reply({ embeds: [err], ephemeral: true });
+      const err = new EmbedBuilder().setColor('Red').setDescription(`❌ Wrong channel. Please use <#${ALLOWED_CHANNEL_ID}>`);
+      if (isMessage) {
+          const msg = await source.reply({ embeds: [err] });
+          setTimeout(() => msg.delete().catch(() => {}), 5000); // Auto-delete redirect after 5s
+          return;
+      }
+      return source.reply({ embeds: [err], ephemeral: true });
   }
   
-  try { if (!isMessage) await source.deferReply({ ephemeral: true }); } catch (e) { return; }
+  // 2. DEFER (Private for Slash, Public for Message)
+  try { if (!isMessage) await source.deferReply({ ephemeral: true }); } catch (e) { return; } 
   const replyMsg = isMessage ? await source.reply('⚡ Checking...') : null;
-  const edit = (d) => isMessage ? replyMsg.edit(d) : source.editReply(d);
+  const sendResponse = async (payload) => {
+      if (isMessage && replyMsg) return replyMsg.edit(payload);
+      return source.editReply(payload);
+  };
 
+  // 3. FETCH & SEND
   const data = await hybridUserLookup(userId);
-  if (!data) return edit({ content: '', embeds: [new EmbedBuilder().setColor('Red').setDescription('You are not ranked yet. Chat more to gain XP!')] });
+  if (!data) return sendResponse({ content: '', embeds: [new EmbedBuilder().setColor('Red').setDescription('You are not ranked yet. Chat more to gain XP!')] });
 
   const embed = new EmbedBuilder().setColor(data.isLive ? '#57F287' : '#5865F2')
+    .setTitle('📊 Symbiotic Rank Lookup')
     .setDescription(`**${data.username}**`)
     .addFields({ name: '🏆 Rank', value: `#${data.rank.toLocaleString()}`, inline: true }, { name: '⭐ Level', value: `${data.level}`, inline: true }, { name: '💎 XP', value: `${data.xp.toLocaleString()}`, inline: true })
     .setFooter({ text: data.isLive ? '🟢 Live Data' : `🟡 Cached Data (${data.dataAge}m ago)` }).setTimestamp();
   if (data.avatar) embed.setThumbnail(`https://cdn.discordapp.com/avatars/${data.userId}/${data.avatar}.png`);
   
-  edit({ content: '', embeds: [embed] });
+  await sendResponse({ content: '', embeds: [embed] });
 }
 
+// ============ EVENT LISTENERS ============
 client.on('interactionCreate', async i => i.isChatInputCommand() && i.commandName === 'irank' && handleRankCommand(i, false, i.user.id));
 
-// [STRICT MODE MESSAGE HANDLER]
 client.on('messageCreate', async (message) => {
-  if (message.author.bot) return; // Ignore bots
-
-  // If we are in the RESTRICTED channel...
-  if (ALLOWED_CHANNEL_ID && message.channelId === ALLOWED_CHANNEL_ID) {
-      // ...and it is NOT an 'irank!' command...
-      if (!message.content.toLowerCase().startsWith('irank!')) {
-          // ...DELETE IT!
-          try { await message.delete(); } catch (e) { console.warn('Could not delete message (missing Manage Messages permission?)'); }
-          return;
-      }
-      // If it IS 'irank!', process it normally
+  if (message.author.bot) return;
+  // If it's a command, handle it (includes redirection if needed)
+  if (message.content.toLowerCase().startsWith('irank!')) {
       await handleRankCommand(message, true, message.author.id);
+      return;
+  }
+  // If it's NOT a command but is in the RESTRICTED channel, delete it (requires 'Manage Messages' permission)
+  if (ALLOWED_CHANNEL_ID && message.channelId === ALLOWED_CHANNEL_ID) {
+      try { await message.delete(); } catch (e) { /* Silently fail if permissions missing */ }
   }
 });
 
